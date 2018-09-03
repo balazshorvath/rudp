@@ -10,8 +10,15 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 
+#define SLIDING_FOR(window_start, window_size, max_value) for(int i = 0, sliding = window_start; i < window_size; ++i, sliding = (i + window_start) % max_value)
+#define INCREMENT_SLIDING(value, max_value) (value = (value + 1) % max_value)
+
+#ifndef MAX
+#define MAX(x, y) ((x > y) ? x : y)
+#endif
+
 #define RUDP_PACKET_MAX_SIZE 512
-#define RUDP_PACKET_HEADER_SIZE 4
+#define RUDP_PACKET_HEADER_SIZE 5
 #define RUDP_PACKET_FOOTER_SIZE 0
 #define RUDP_PACKET_MAX_DATA_SIZE RUDP_PACKET_MAX_SIZE - RUDP_PACKET_HEADER_SIZE - RUDP_PACKET_FOOTER_SIZE
 
@@ -31,6 +38,7 @@
 #define RUDP_PACKET_ACK_RECEIVED 6
 
 #define RUDP_WINDOW_SIZE 10
+#define RUDP_WINDOW_BUFFER_SIZE 10
 #define RUDP_BUFFER_SIZE 10
 #define RUDP_MAX_SESSION_PER_SOCKET 10
 
@@ -39,12 +47,14 @@
 #define RUDP_SOCKET_CLOSED 2
 
 #define RUDP_SESSION_EMPTY 0
-#define RUDP_SESSION_ALIVE 1
-#define RUDP_SESSION_ERROR 2
-#define RUDP_SESSION_CLOSED 2
+#define RUDP_SESSION_NEW 1
+#define RUDP_SESSION_ALIVE 2
+#define RUDP_SESSION_ERROR 3
+#define RUDP_SESSION_CLOSED 4
 
 typedef struct {
     uint16_t frame;
+    uint8_t type;
     uint16_t size;
     int8_t data[RUDP_PACKET_MAX_DATA_SIZE];
 } rudp_packet;
@@ -59,9 +69,10 @@ typedef struct {
     struct sockaddr_in address;
     uint16_t next_frame_send;
     uint16_t next_frame_recv;
-    rudp_packet_state window_recv[RUDP_WINDOW_SIZE];
-    rudp_packet_state window_send[RUDP_WINDOW_SIZE];
-    rudp_packet buffer[RUDP_BUFFER_SIZE];
+    uint16_t buffer_head;
+    rudp_packet_state window_recv[RUDP_WINDOW_BUFFER_SIZE];
+    rudp_packet_state window_send[RUDP_WINDOW_BUFFER_SIZE];
+    rudp_packet_state buffer[RUDP_BUFFER_SIZE];
 } rudp_session;
 
 typedef struct {
@@ -78,7 +89,11 @@ rudp_socket* rudp_create(const char* address, uint16_t port);
 
 int32_t rudp_send(rudp_socket* sock, rudp_session* session, const char* data, uint16_t size);
 
-rudp_session* rudp_receive(rudp_socket* sock, char* data, uint16_t size);
+rudp_session* rudp_accept(rudp_socket* sock);
+
+int32_t rudp_recv(rudp_session* session, char* buffer, uint16_t size);
+
+void rudp_session_close(rudp_session* session);
 
 void rudp_close(rudp_socket* sock);
 

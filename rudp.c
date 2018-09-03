@@ -9,10 +9,51 @@
 #include <stdbool.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
+#include <signal.h>
 
 #include "rudp.h"
 
 /* Private functions */
+
+bool rudp_session_buffer_push(rudp_session* session, rudp_packet_state* packet_state) {
+    //TODO threadsafe
+    SLIDING_FOR(session->buffer_head, RUDP_BUFFER_SIZE, RUDP_BUFFER_SIZE) {
+        printf("rudp_session_buffer_push %d", sliding);
+        if (session->buffer[sliding].state == RUDP_PACKET_EMPTY) {
+            memcpy(&session->buffer[sliding], packet_state, sizeof(rudp_packet_state));
+//            session->buffer[sliding].state = RUDP_PACKET_ACK_SENT;
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * Sends an acknowledgement message for the specified packet.
+ *
+ * @param sock
+ * @param session
+ * @param packet
+ * @return
+ */
+int32_t rudp_send_ack(rudp_socket* sock, rudp_session* session, rudp_packet_state* packet) {
+    rudp_packet ack = {.frame = packet->packet.frame, .type = RUDP_ACK, .size = 0};
+    int32_t sent_bytes = (int32_t) sendto(
+            sock->socket_handle,
+            (void*) &ack,
+            RUDP_PACKET_HEADER_SIZE,
+            0,
+            (struct sockaddr*) &session->address,
+            sizeof(session->address)
+    );
+    if (sent_bytes == -1) {
+        perror("Failed to send ack message");
+        return -1;
+    }
+    packet->state = RUDP_PACKET_ACK_SENT;
+    return sent_bytes;
+}
+
 /**
  * Compare the two addresses.
  * Checks whether the version of the addresses, ports and actual address.
@@ -56,17 +97,21 @@ int rudp_cmp_addresses(struct sockaddr_in* first, struct sockaddr_in* second) {
  * @param session
  * @param packet
  */
-void rudp_new_packet(rudp_session* session, rudp_packet* packet) {
+void rudp_new_packet(rudp_socket* sock, rudp_session* session, rudp_packet* packet) {
     // TODO threadsafe, window frame state?
     // TODO ack if possible
     //No negative check, this is unsigned
-    if (packet->frame >= RUDP_WINDOW_SIZE) {
+    if (session->next_frame_recv >= packet->frame || packet->frame >= session->next_frame_recv + RUDP_WINDOW_SIZE) {
         // TODO statistics
-        // TODO is there a way to ask for a resend? We don't know the frame number.
+        // TODO is there a way to ask for a resend? We don't know the frame number. Assume the number is actually corrupt.
         return;
     }
     if (session->window_recv[packet->frame].state == RUDP_PACKET_EMPTY) {
-        memcpy(&session->window_recv[packet->frame].packet, packet, sizeof(*packet));
+        memcpy(&session->window_recv[packet->frame].packet, packet, sizeof(rudp_packet));
+        session->window_recv[packet->frame].state = RUDP_PACKET_RECEIVED;
+    } else {
+        // TODO statistics
+        return;
     }
     // This means, we have the correct packet
     // Check if we can send acknowledgement for more packets.
@@ -74,12 +119,32 @@ void rudp_new_packet(rudp_session* session, rudp_packet* packet) {
     //
     //  1. Packet2 arrives, no ACK, we need to wait for Packet1
     //  2. Packet1 arrives, send ACK for packet two and slide the window by 2.
-    //  3. Sender rececves the ACK for packet two, assumes, packet 1 arrived as well.
+    //  3. Sender receives the ACK for packet two, assumes, packet 1 arrived as well.
     //
     // Maybe to make sure we don't get stuck by acks not arriving, we should send every ack, to increase chances.
     //
-    if (packet->frame == session->next_frame_recv) {
+    uint16_t sliding;
+    for (int i = 0; i < RUDP_WINDOW_SIZE; ++i) {
+        sliding = (uint16_t) ((i + session->next_frame_send) % RUDP_WINDOW_BUFFER_SIZE);
+        // Go until we have messages waiting to be responded to.
+        //
+        if (session->window_recv[sliding].state == RUDP_PACKET_RECEIVED) {
+            //Send ack
+            rudp_send_ack(sock, session, &session->window_recv[sliding]);
 
+            if (session->window_recv[sliding].state == RUDP_PACKET_ACK_SENT) {
+                //TODO multi-packet messages should still be a thing.
+                //TODO what if this fails?
+                rudp_session_buffer_push(session, &session->window_recv[sliding]);
+                INCREMENT_SLIDING(session->next_frame_recv, RUDP_WINDOW_BUFFER_SIZE);
+
+            } else {
+                //TODO statistics
+                //TODO retry
+            }
+        } else {
+            break;
+        }
     }
 }
 
@@ -105,8 +170,23 @@ bool rudp_is_session_state(rudp_session* session, uint8_t state) {
     return session->state == state;
 }
 
+bool rudp_set_session_state_if(rudp_session* session, uint8_t expected, uint8_t new_state) {
+    //TODO thredsafe
+    if (session->state == expected) {
+        session->state = new_state;
+        return true;
+    }
+    return false;
+}
+
 /**
  * Initialize a session, if the session is not in use.
+ *
+ * Session lifecycle:
+ *  1. EMPTY-> initial state
+ *  2. NEW-> rudp_initialize_session_if_empty() is called
+ *  3. ALIVE-> rudp_accept() is called and this session is returned
+ *  4. CLOSED/ERROR-> somethis bad happens, ot the session is closed
  *
  * @param session
  * @param sender
@@ -114,10 +194,9 @@ bool rudp_is_session_state(rudp_session* session, uint8_t state) {
  */
 bool rudp_initialize_session_if_empty(rudp_session* session, struct sockaddr_in* sender) {
     //TODO thredsafe
-    if (session->state != RUDP_SESSION_EMPTY) {
+    if (!rudp_set_session_state_if(session, RUDP_SESSION_EMPTY, RUDP_SESSION_NEW)) {
         return false;
     }
-    session->state = RUDP_SESSION_ALIVE;
     session->next_frame_send = 0;
     session->next_frame_recv = 0;
     //TODO IPv6
@@ -140,6 +219,7 @@ void* receiver_thread(void* ptr) {
 
     while (rudp_is_socket_state(sock, RUDP_SOCKET_AVAILABLE)) {
         new_session = true;
+        //TODO use 'select' for timeout
         /** From docs:
          * All three routines return the length of the message on successful completion. If a message is too long
          * to fit in the supplied buffer, excess bytes may be discarded depending on the type of socket the message
@@ -162,7 +242,7 @@ void* receiver_thread(void* ptr) {
         for (int i = 0; i < RUDP_MAX_SESSION_PER_SOCKET; ++i) {
             if (rudp_is_session_state(&sock->sessions[i], RUDP_SESSION_ALIVE) &&
                 rudp_cmp_addresses(&sock->sessions[i].address, &sender)) {
-                rudp_new_packet(&sock->sessions[i], &packet);
+                rudp_new_packet(sock, &sock->sessions[i], &packet);
                 new_session = false;
                 break;
             }
@@ -171,14 +251,17 @@ void* receiver_thread(void* ptr) {
             // TODO optimize, try to avoid full iteration every time
             for (int i = 0; i < RUDP_MAX_SESSION_PER_SOCKET; ++i) {
                 if (rudp_initialize_session_if_empty(&sock->sessions[i], &sender)) {
-                    rudp_new_packet(&sock->sessions[i], &packet);
+                    rudp_new_packet(sock, &sock->sessions[i], &packet);
+                    new_session = false;
                     break;
                 }
             }
+            if (new_session) {
+                //TODO respond with no slots left.
+                fprintf(stderr, "There isn't enough session slots left.\n");
+            }
         }
-
     }
-
     return NULL;
 }
 
@@ -191,6 +274,7 @@ rudp_socket* alloc_socket() {
 }
 
 void free_socket(rudp_socket* sock) {
+    //TODO threadsafe
     if (sock != NULL)
         free(sock);
 }
@@ -217,7 +301,7 @@ rudp_socket* rudp_create(const char* address, uint16_t port) {
         return NULL;
     }
     if ((sock->socket_handle = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)) == -1) {
-        fprintf(stderr, "Failed to create socket.\n");
+        perror("Failed to create socket");
         free_socket(sock);
         return NULL;
     }
@@ -226,7 +310,7 @@ rudp_socket* rudp_create(const char* address, uint16_t port) {
     sock->address.sin_port = htons(port);
 
     if (inet_aton(address, &sock->address.sin_addr) == 0) {
-        fprintf(stderr, "Address is in wrong format\n");
+        perror("Error while converting address");
         rudp_close(sock);
         return NULL;
     }
@@ -249,7 +333,7 @@ int32_t rudp_send(rudp_socket* sock, rudp_session* session, const char* data, ui
     rudp_packet_state* state = NULL;
     uint16_t sliding = 0;
     for (int i = 0; i < RUDP_WINDOW_SIZE; ++i) {
-        sliding = (uint16_t) ((i + session->next_frame_send) % RUDP_WINDOW_SIZE);
+        sliding = (uint16_t) ((i + session->next_frame_send) % RUDP_WINDOW_BUFFER_SIZE);
         if (session->window_send[sliding].state == RUDP_PACKET_EMPTY) {
             state = &session->window_send[sliding];
             break;
@@ -275,30 +359,61 @@ int32_t rudp_send(rudp_socket* sock, rudp_session* session, const char* data, ui
     );
     //TODO what if can't send message.
     if (sent_bytes == -1) {
+        perror("Could not send message");
         return -1;
     }
     state->state = RUDP_PACKET_SENT;
     return sent_bytes;
 }
 
-rudp_session* rudp_receive(rudp_socket* sock, char* data, uint16_t size) {
-    struct sockaddr_in sender;
-    socklen_t socklen;
-    int32_t recv = (int32_t) recvfrom(
-            sock->socket_handle,
-            data,
-            size,
-            0,
-            (struct sockaddr*) &sender,
-            &socklen
-    );
-    if (recv == -1) {
-        return NULL;
+/**
+ * Returns with a session, if there is one with RUDP_SESSION_NEW state.
+ * Also sets the state to ALIVE, meaning, that the session has been recognized by the application and is being used.
+ *
+ * @param sock
+ * @return
+ */
+rudp_session* rudp_accept(rudp_socket* sock) {
+    //TODO lock on socket
+    for (int i = 0; i < RUDP_MAX_SESSION_PER_SOCKET; ++i) {
+        if (rudp_set_session_state_if(&sock->sessions[i], RUDP_SESSION_NEW, RUDP_SESSION_ALIVE)) {
+            return &sock->sessions[i];
+        }
     }
-    return session;
-    //print details of the client/peer and the data received
-//    printf("Received packet from %s:%d\n", inet_ntoa(si_other.sin_addr), ntohs(si_other.sin_port));
-//    printf("Data: %s\n", buf);
+    return NULL;
+}
+
+/**
+ * If a session got into an error state, the session can be freed with this call.
+ *
+ * @param session
+ */
+void rudp_session_close(rudp_session* session) {
+    rudp_set_session_state(session, RUDP_SESSION_EMPTY);
+}
+
+/**
+ * If the buffer is too small for the amount of data in the packet, the rest of the data will be lost.
+ *
+ * @param session
+ * @param data
+ * @param size
+ * @return
+ */
+int32_t rudp_recv(rudp_session* session, char* data, uint16_t size) {
+    //TODO lock on session
+    if (session->buffer[session->buffer_head].state != RUDP_PACKET_EMPTY) {
+        session->buffer[session->buffer_head].state = RUDP_PACKET_EMPTY;
+        uint16_t actual_size = MAX(session->buffer[session->buffer_head].packet.size, size);
+        memcpy(
+                data,
+                session->buffer[session->buffer_head].packet.data,
+                actual_size
+        );
+        INCREMENT_SLIDING(session->buffer_head, RUDP_BUFFER_SIZE);
+        return actual_size;
+    }
+    return -1;
 }
 
 void rudp_close(rudp_socket* sock) {
